@@ -1,339 +1,488 @@
+#!/usr/bin/env python3
 """
-Nano-Sensor Network Management System
-BlackRoad OS - Distributed sensor fleet orchestration
+BlackRoad Nano-Sensor / Climate Tracker
+Distributed environmental sensor network management with anomaly detection,
+trend analysis, and time-series export.
+
+Usage:
+    python nano_sensor.py register --station S001 --location "Point Reyes, CA" --lat 38.0 --lon -122.8
+    python nano_sensor.py log --station S001 --temp 18.5 --humidity 72 --pressure 1013 --precip 0.0 --wind 3.2
+    python nano_sensor.py trend --station S001 --metric temp_c --days 30
+    python nano_sensor.py extreme --station S001 --pct 95
+    python nano_sensor.py anomaly --station S001 --baseline 30
+    python nano_sensor.py export --station S001 --metric temp_c --format csv
+    python nano_sensor.py fleet --status
 """
 
-import sqlite3
+from __future__ import annotations
+
+import argparse
+import csv
 import json
+import math
+import sqlite3
 import statistics
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-import argparse
-import sys
+from typing import Dict, List, Optional, Tuple
+
+DB_PATH = Path.home() / ".blackroad" / "nano_sensor.db"
+
+METRICS = ["temp_c", "humidity_pct", "pressure_hpa", "precipitation_mm", "wind_ms",
+           "co2_ppm", "pm25_ugm3", "uv_index", "noise_db", "lux"]
+
+METRIC_LABELS: Dict[str, str] = {
+    "temp_c":          "Temperature (°C)",
+    "humidity_pct":    "Relative Humidity (%)",
+    "pressure_hpa":    "Atmospheric Pressure (hPa)",
+    "precipitation_mm":"Precipitation (mm)",
+    "wind_ms":         "Wind Speed (m/s)",
+    "co2_ppm":         "CO₂ (ppm)",
+    "pm25_ugm3":       "PM2.5 (µg/m³)",
+    "uv_index":        "UV Index",
+    "noise_db":        "Noise Level (dB)",
+    "lux":             "Illuminance (lux)",
+}
+
+# WHO / NOAA threshold references for extreme detection
+SAFE_RANGES: Dict[str, Tuple[float, float]] = {
+    "temp_c":           (-50,   55),
+    "humidity_pct":     (0,    100),
+    "pressure_hpa":     (870,  1084),
+    "precipitation_mm": (0,    500),
+    "wind_ms":          (0,     80),
+    "co2_ppm":          (300,  2000),
+    "pm25_ugm3":        (0,    250),
+    "uv_index":         (0,     15),
+    "noise_db":         (0,    140),
+    "lux":              (0,  200000),
+}
+
+
+# ── Dataclasses ────────────────────────────────────────────────────────────────
+
+@dataclass
+class SensorStation:
+    id:          int
+    station_id:  str
+    location:    str
+    latitude:    float
+    longitude:   float
+    altitude_m:  float
+    sensor_type: str
+    active:      bool
+    installed_at: str
+    notes:       str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass
-class Sensor:
-    """Sensor device descriptor"""
-    id: str
-    name: str
-    type: str  # temperature, humidity, pressure, co2, motion, light, vibration, chemical, radiation, bio
-    location: str
-    unit: str
-    value: Optional[float] = None
-    battery_pct: float = 100.0
-    last_seen: Optional[str] = None
-    firmware_version: str = "1.0.0"
-    tags: List[str] = field(default_factory=list)
+class ClimateRecord:
+    id:               int
+    station_id:       str
+    location:         str
+    recorded_at:      str
+    temp_c:           float
+    humidity_pct:     float
+    pressure_hpa:     float
+    precipitation_mm: float
+    wind_ms:          float
+    co2_ppm:          float = 415.0
+    pm25_ugm3:        float = 0.0
+    uv_index:         float = 0.0
+    noise_db:         float = 0.0
+    lux:              float = 0.0
+    quality_flag:     int   = 1    # 1=good, 0=suspect, -1=bad
+    notes:            str   = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-@dataclass
-class SensorReading:
-    """Sensor measurement record"""
-    sensor_id: str
-    value: float
-    timestamp: str
-    quality: float = 1.0
+# ── Database ───────────────────────────────────────────────────────────────────
+
+def get_conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _init_db(conn)
+    return conn
 
 
-class NanoSensorNetwork:
-    """Distributed nano-sensor network controller"""
-    
-    VALID_SENSOR_TYPES = {
-        "temperature", "humidity", "pressure", "co2", "motion",
-        "light", "vibration", "chemical", "radiation", "bio"
+def _init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS stations (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            station_id   TEXT NOT NULL UNIQUE,
+            location     TEXT NOT NULL DEFAULT '',
+            latitude     REAL NOT NULL DEFAULT 0,
+            longitude    REAL NOT NULL DEFAULT 0,
+            altitude_m   REAL NOT NULL DEFAULT 0,
+            sensor_type  TEXT NOT NULL DEFAULT 'multi',
+            active       INTEGER NOT NULL DEFAULT 1,
+            installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            notes        TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS climate_records (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            station_id       TEXT NOT NULL,
+            location         TEXT NOT NULL DEFAULT '',
+            recorded_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            temp_c           REAL NOT NULL DEFAULT 0,
+            humidity_pct     REAL NOT NULL DEFAULT 0,
+            pressure_hpa     REAL NOT NULL DEFAULT 1013.25,
+            precipitation_mm REAL NOT NULL DEFAULT 0,
+            wind_ms          REAL NOT NULL DEFAULT 0,
+            co2_ppm          REAL NOT NULL DEFAULT 415,
+            pm25_ugm3        REAL NOT NULL DEFAULT 0,
+            uv_index         REAL NOT NULL DEFAULT 0,
+            noise_db         REAL NOT NULL DEFAULT 0,
+            lux              REAL NOT NULL DEFAULT 0,
+            quality_flag     INTEGER NOT NULL DEFAULT 1,
+            notes            TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_cr_station ON climate_records(station_id);
+        CREATE INDEX IF NOT EXISTS idx_cr_ts      ON climate_records(recorded_at);
+    """)
+    conn.commit()
+
+
+# ── Station management ─────────────────────────────────────────────────────────
+
+def register_station(
+    station_id: str, location: str = "",
+    latitude: float = 0.0, longitude: float = 0.0,
+    altitude_m: float = 0.0, sensor_type: str = "multi", notes: str = "",
+) -> SensorStation:
+    now = datetime.now().isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR REPLACE INTO stations"
+            "(station_id,location,latitude,longitude,altitude_m,sensor_type,active,installed_at,notes)"
+            " VALUES(?,?,?,?,?,?,1,?,?)",
+            (station_id, location, latitude, longitude, altitude_m, sensor_type, now, notes),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM stations WHERE station_id=?", (station_id,)).fetchone()
+    return SensorStation(**dict(row))
+
+
+def get_station(station_id: str) -> Optional[SensorStation]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM stations WHERE station_id=?", (station_id,)
+        ).fetchone()
+    return SensorStation(**dict(row)) if row else None
+
+
+def fleet_status() -> List[dict]:
+    with get_conn() as conn:
+        stations = conn.execute("SELECT * FROM stations ORDER BY station_id").fetchall()
+        result   = []
+        for st in stations:
+            last = conn.execute(
+                "SELECT recorded_at, temp_c, humidity_pct FROM climate_records"
+                " WHERE station_id=? ORDER BY recorded_at DESC LIMIT 1",
+                (st["station_id"],),
+            ).fetchone()
+            d = dict(st)
+            d["last_reading"] = dict(last) if last else None
+            result.append(d)
+    return result
+
+
+# ── Climate data ───────────────────────────────────────────────────────────────
+
+def log_record(
+    station_id: str,
+    temp_c: float,
+    humidity_pct: float,
+    pressure_hpa: float = 1013.25,
+    precipitation_mm: float = 0.0,
+    wind_ms: float = 0.0,
+    co2_ppm: float = 415.0,
+    pm25_ugm3: float = 0.0,
+    uv_index: float = 0.0,
+    noise_db: float = 0.0,
+    lux: float = 0.0,
+    quality_flag: int = 1,
+    notes: str = "",
+    recorded_at: Optional[str] = None,
+) -> ClimateRecord:
+    st  = get_station(station_id)
+    loc = st.location if st else ""
+    ts  = recorded_at or datetime.now().isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO climate_records"
+            "(station_id,location,recorded_at,temp_c,humidity_pct,pressure_hpa,"
+            "precipitation_mm,wind_ms,co2_ppm,pm25_ugm3,uv_index,noise_db,lux,"
+            "quality_flag,notes)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (station_id, loc, ts, temp_c, humidity_pct, pressure_hpa,
+             precipitation_mm, wind_ms, co2_ppm, pm25_ugm3, uv_index,
+             noise_db, lux, quality_flag, notes),
+        )
+        conn.commit()
+        row_id = cur.lastrowid
+    return ClimateRecord(row_id, station_id, loc, ts, temp_c, humidity_pct,
+                         pressure_hpa, precipitation_mm, wind_ms, co2_ppm,
+                         pm25_ugm3, uv_index, noise_db, lux, quality_flag, notes)
+
+
+def _fetch_records(station_id: str, days: int) -> List[ClimateRecord]:
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM climate_records WHERE station_id=? AND recorded_at>=?"
+            " ORDER BY recorded_at",
+            (station_id, since),
+        ).fetchall()
+    return [ClimateRecord(**dict(r)) for r in rows]
+
+
+def get_trend(station_id: str, metric: str, days: int = 30) -> dict:
+    """Linear regression trend for a metric over N days."""
+    records = _fetch_records(station_id, days)
+    if not records:
+        return {"station_id": station_id, "metric": metric, "error": "no_data"}
+
+    values = [getattr(r, metric, 0.0) for r in records]
+    n      = len(values)
+    mean_v = statistics.mean(values)
+    x      = list(range(n))
+    mean_x = statistics.mean(x)
+
+    cov_xy = sum((xi - mean_x) * (yi - mean_v) for xi, yi in zip(x, values))
+    var_x  = sum((xi - mean_x) ** 2 for xi in x) or 1
+    slope  = cov_xy / var_x
+    interc = mean_v - slope * mean_x
+
+    # Trend magnitude normalized per day
+    records_per_day = n / days if days else 1
+    slope_per_day   = slope * records_per_day
+
+    direction = "rising" if slope_per_day > 0.01 else "falling" if slope_per_day < -0.01 else "stable"
+    return {
+        "station_id":     station_id,
+        "metric":         metric,
+        "label":          METRIC_LABELS.get(metric, metric),
+        "days":           days,
+        "n_readings":     n,
+        "mean":           round(mean_v, 4),
+        "min":            round(min(values), 4),
+        "max":            round(max(values), 4),
+        "stddev":         round(statistics.stdev(values), 4) if n > 1 else 0.0,
+        "slope_per_day":  round(slope_per_day, 6),
+        "trend":          direction,
+        "first":          round(values[0], 4),
+        "last":           round(values[-1], 4),
+        "change":         round(values[-1] - values[0], 4),
     }
-    
-    def __init__(self, db_path: str = "~/.blackroad/sensors.db"):
-        self.db_path = Path(db_path).expanduser()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn: Optional[sqlite3.Connection] = None
-        self._init_db()
-    
-    def _init_db(self):
-        """Initialize SQLite database schema"""
-        self.conn = sqlite3.connect(str(self.db_path))
-        cursor = self.conn.cursor()
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS sensors (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                location TEXT NOT NULL,
-                unit TEXT NOT NULL,
-                value REAL,
-                battery_pct REAL DEFAULT 100.0,
-                last_seen TEXT,
-                firmware_version TEXT DEFAULT '1.0.0',
-                tags TEXT DEFAULT '[]',
-                created_at TEXT,
-                UNIQUE(name, location)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS readings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sensor_id TEXT NOT NULL,
-                value REAL NOT NULL,
-                timestamp TEXT NOT NULL,
-                quality REAL DEFAULT 1.0,
-                FOREIGN KEY(sensor_id) REFERENCES sensors(id),
-                INDEX idx_sensor_time (sensor_id, timestamp DESC)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS calibration (
-                sensor_id TEXT PRIMARY KEY,
-                offset REAL DEFAULT 0.0,
-                scale REAL DEFAULT 1.0,
-                calibrated_at TEXT,
-                FOREIGN KEY(sensor_id) REFERENCES sensors(id)
-            )
-        """)
-        
-        self.conn.commit()
-    
-    def register_sensor(self, name: str, type: str, location: str, unit: str, 
-                       tags: List[str] = None) -> str:
-        """Register a new sensor in the network"""
-        if type not in self.VALID_SENSOR_TYPES:
-            raise ValueError(f"Invalid sensor type: {type}")
-        
-        tags = tags or []
-        sensor_id = f"{type}_{location.replace(' ', '_').lower()}_{int(datetime.now().timestamp() * 1000) % 10000}"
-        now = datetime.now().isoformat()
-        
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO sensors 
-            (id, name, type, location, unit, tags, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (sensor_id, name, type, location, unit, json.dumps(tags), now))
-        self.conn.commit()
-        
-        return sensor_id
-    
-    def ingest_reading(self, sensor_id: str, value: float, quality: float = 1.0) -> bool:
-        """Record a sensor reading"""
-        cursor = self.conn.cursor()
-        now = datetime.now().isoformat()
-        
-        # Validate sensor exists
-        cursor.execute("SELECT id FROM sensors WHERE id = ?", (sensor_id,))
-        if not cursor.fetchone():
-            return False
-        
-        # Store reading
-        cursor.execute("""
-            INSERT INTO readings (sensor_id, value, timestamp, quality)
-            VALUES (?, ?, ?, ?)
-        """, (sensor_id, value, now, quality))
-        
-        # Update sensor's current value and last_seen
-        cursor.execute("""
-            UPDATE sensors SET value = ?, last_seen = ?
-            WHERE id = ?
-        """, (value, now, sensor_id))
-        
-        self.conn.commit()
-        return True
-    
-    def get_latest(self, sensor_id: str) -> Optional[SensorReading]:
-        """Get most recent reading for a sensor"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT sensor_id, value, timestamp, quality
-            FROM readings
-            WHERE sensor_id = ?
-            ORDER BY timestamp DESC
-            LIMIT 1
-        """, (sensor_id,))
-        
-        row = cursor.fetchone()
-        if row:
-            return SensorReading(*row)
-        return None
-    
-    def get_history(self, sensor_id: str, hours: int = 24) -> List[SensorReading]:
-        """Get readings from the last N hours"""
-        cursor = self.conn.cursor()
-        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
-        
-        cursor.execute("""
-            SELECT sensor_id, value, timestamp, quality
-            FROM readings
-            WHERE sensor_id = ? AND timestamp >= ?
-            ORDER BY timestamp DESC
-        """, (sensor_id, cutoff))
-        
-        return [SensorReading(*row) for row in cursor.fetchall()]
-    
-    def get_stats(self, sensor_id: str, hours: int = 24) -> Dict:
-        """Compute statistics over N hours"""
-        readings = self.get_history(sensor_id, hours)
-        if not readings:
-            return {"count": 0}
-        
-        values = [r.value for r in readings]
-        
-        return {
-            "count": len(values),
-            "min": min(values),
-            "max": max(values),
-            "avg": statistics.mean(values),
-            "std_dev": statistics.stdev(values) if len(values) > 1 else 0.0,
-            "latest": values[0] if values else None
+
+
+def detect_extreme(station_id: str, threshold_pct: float = 95.0, days: int = 365) -> dict:
+    """Flag readings above the Nth percentile for each metric."""
+    records  = _fetch_records(station_id, days)
+    if not records:
+        return {"station_id": station_id, "extremes": {}, "error": "no_data"}
+
+    extremes: Dict[str, dict] = {}
+    for metric in METRICS:
+        vals = [getattr(r, metric, 0.0) for r in records]
+        if not any(v != 0 for v in vals):
+            continue
+        sorted_v = sorted(vals)
+        pct_idx  = max(0, int(len(sorted_v) * threshold_pct / 100) - 1)
+        threshold = sorted_v[pct_idx]
+        extreme_recs = [
+            {"id": r.id, "recorded_at": r.recorded_at, "value": getattr(r, metric)}
+            for r in records if getattr(r, metric, 0.0) >= threshold
+        ]
+        # Also flag safe-range violations
+        safe = SAFE_RANGES.get(metric)
+        violations = []
+        if safe:
+            lo, hi = safe
+            violations = [
+                {"id": r.id, "recorded_at": r.recorded_at,
+                 "value": getattr(r, metric), "reason": "below_safe" if getattr(r,metric)<lo else "above_safe"}
+                for r in records
+                if not (lo <= getattr(r, metric, lo) <= hi)
+            ]
+        extremes[metric] = {
+            "threshold_pct":   threshold_pct,
+            "threshold_value": round(threshold, 4),
+            "n_extreme":       len(extreme_recs),
+            "extreme_events":  extreme_recs[:10],  # cap output
+            "n_violations":    len(violations),
+            "violations":      violations[:5],
         }
-    
-    def get_anomalies(self, sensor_id: str, threshold_std: float = 2.0) -> List[SensorReading]:
-        """Find readings that deviate > N standard deviations from mean"""
-        readings = self.get_history(sensor_id, hours=24)
-        if not readings:
-            return []
-        
-        values = [r.value for r in readings]
-        if len(values) < 2:
-            return []
-        
-        mean = statistics.mean(values)
-        std_dev = statistics.stdev(values)
-        
-        return [
-            r for r in readings
-            if abs((r.value - mean) / std_dev) > threshold_std
-        ]
-    
-    def fleet_status(self) -> List[Dict]:
-        """Get status of all sensors"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT id, name, type, location, value, battery_pct, last_seen
-            FROM sensors
-            ORDER BY last_seen DESC NULLS LAST
-        """)
-        
-        return [
-            {
-                "id": row[0],
-                "name": row[1],
-                "type": row[2],
-                "location": row[3],
-                "current_value": row[4],
-                "battery_pct": row[5],
-                "last_seen": row[6]
-            }
-            for row in cursor.fetchall()
-        ]
-    
-    def alert_check(self) -> Dict:
-        """Check for sensors needing attention"""
-        cursor = self.conn.cursor()
-        now = datetime.now()
-        one_hour_ago = (now - timedelta(hours=1)).isoformat()
-        
-        # Low battery
-        cursor.execute("""
-            SELECT id, name, battery_pct FROM sensors WHERE battery_pct < 10
-        """)
-        low_battery = [
-            {"id": row[0], "name": row[1], "battery_pct": row[2]}
-            for row in cursor.fetchall()
-        ]
-        
-        # Stale readings
-        cursor.execute("""
-            SELECT id, name, last_seen FROM sensors 
-            WHERE last_seen IS NULL OR last_seen < ?
-        """, (one_hour_ago,))
-        stale_sensors = [
-            {"id": row[0], "name": row[1], "last_seen": row[2]}
-            for row in cursor.fetchall()
-        ]
-        
-        return {
-            "low_battery": low_battery,
-            "stale_sensors": stale_sensors
+    return {"station_id": station_id, "days": days, "extremes": extremes}
+
+
+def calculate_anomaly(station_id: str, baseline_days: int = 30, compare_days: int = 7) -> dict:
+    """
+    Compare recent N days vs baseline to detect anomalous departures.
+    Returns Z-score style deviation per metric.
+    """
+    baseline_recs = _fetch_records(station_id, baseline_days)
+    recent_recs   = _fetch_records(station_id, compare_days)
+
+    if not baseline_recs:
+        return {"station_id": station_id, "error": "insufficient_baseline"}
+
+    anomalies: Dict[str, dict] = {}
+    for metric in METRICS:
+        base_vals   = [getattr(r, metric, 0.0) for r in baseline_recs]
+        recent_vals = [getattr(r, metric, 0.0) for r in recent_recs]
+
+        if not any(v != 0 for v in base_vals):
+            continue
+
+        base_mean = statistics.mean(base_vals)
+        base_std  = statistics.stdev(base_vals) if len(base_vals) > 1 else 1.0
+        if not recent_vals:
+            continue
+        recent_mean = statistics.mean(recent_vals)
+        z_score     = (recent_mean - base_mean) / (base_std or 1.0)
+
+        anomalies[metric] = {
+            "baseline_mean":  round(base_mean, 4),
+            "baseline_std":   round(base_std, 4),
+            "recent_mean":    round(recent_mean, 4),
+            "departure":      round(recent_mean - base_mean, 4),
+            "z_score":        round(z_score, 3),
+            "anomalous":      abs(z_score) > 2.0,
+            "label":          METRIC_LABELS.get(metric, metric),
         }
-    
-    def calibrate(self, sensor_id: str, offset: float, scale: float = 1.0) -> bool:
-        """Store calibration parameters for a sensor"""
-        cursor = self.conn.cursor()
-        
-        # Verify sensor exists
-        cursor.execute("SELECT id FROM sensors WHERE id = ?", (sensor_id,))
-        if not cursor.fetchone():
-            return False
-        
-        now = datetime.now().isoformat()
-        cursor.execute("""
-            INSERT OR REPLACE INTO calibration 
-            (sensor_id, offset, scale, calibrated_at)
-            VALUES (?, ?, ?, ?)
-        """, (sensor_id, offset, scale, now))
-        
-        self.conn.commit()
-        return True
-    
-    def close(self):
-        """Close database connection"""
-        if self.conn:
-            self.conn.close()
+
+    flagged = [m for m, v in anomalies.items() if v["anomalous"]]
+    return {
+        "station_id":      station_id,
+        "baseline_days":   baseline_days,
+        "compare_days":    compare_days,
+        "n_flagged":       len(flagged),
+        "flagged_metrics": flagged,
+        "metrics":         anomalies,
+    }
+
+
+def export_timeseries(station_id: str, metric: str, fmt: str = "csv", days: int = 30) -> str:
+    """Export a single metric time series as CSV or JSON."""
+    records = _fetch_records(station_id, days)
+    data    = [
+        {"recorded_at": r.recorded_at, "value": getattr(r, metric, 0.0),
+         "quality_flag": r.quality_flag}
+        for r in records
+    ]
+    if fmt == "json":
+        return json.dumps({
+            "station_id": station_id, "metric": metric,
+            "label": METRIC_LABELS.get(metric, metric),
+            "days": days, "n": len(data), "series": data,
+        }, indent=2)
+
+    out    = StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["recorded_at", metric, "quality_flag"])
+    for row in data:
+        writer.writerow([row["recorded_at"], row["value"], row["quality_flag"]])
+    return out.getvalue()
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def _print(obj):
+    print(json.dumps(obj, indent=2, default=str))
 
 
 def main():
-    """CLI interface"""
-    parser = argparse.ArgumentParser(description="Nano-Sensor Network Controller")
-    subparsers = parser.add_subparsers(dest="command", help="Commands")
-    
-    # Fleet command
-    subparsers.add_parser("fleet", help="Show fleet status")
-    
-    # Ingest command
-    ingest = subparsers.add_parser("ingest", help="Ingest sensor reading")
-    ingest.add_argument("sensor_id", help="Sensor ID")
-    ingest.add_argument("value", type=float, help="Reading value")
-    ingest.add_argument("--quality", type=float, default=1.0, help="Reading quality (0-1)")
-    
-    # Anomalies command
-    anomalies = subparsers.add_parser("anomalies", help="Find anomalous readings")
-    anomalies.add_argument("sensor_id", help="Sensor ID")
-    anomalies.add_argument("--threshold", type=float, default=2.0, help="Std deviation threshold")
-    
+    parser = argparse.ArgumentParser(description="BlackRoad Nano-Sensor / Climate Tracker")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("register", help="Register a sensor station")
+    p.add_argument("--station",  required=True, dest="station_id")
+    p.add_argument("--location", default="")
+    p.add_argument("--lat",      type=float, default=0, dest="latitude")
+    p.add_argument("--lon",      type=float, default=0, dest="longitude")
+    p.add_argument("--alt",      type=float, default=0, dest="altitude_m")
+    p.add_argument("--type",     default="multi", dest="sensor_type")
+    p.add_argument("--notes",    default="")
+
+    p = sub.add_parser("log", help="Log a climate reading")
+    p.add_argument("--station",   required=True, dest="station_id")
+    p.add_argument("--temp",      type=float, required=True, dest="temp_c")
+    p.add_argument("--humidity",  type=float, required=True, dest="humidity_pct")
+    p.add_argument("--pressure",  type=float, default=1013.25, dest="pressure_hpa")
+    p.add_argument("--precip",    type=float, default=0, dest="precipitation_mm")
+    p.add_argument("--wind",      type=float, default=0, dest="wind_ms")
+    p.add_argument("--co2",       type=float, default=415, dest="co2_ppm")
+    p.add_argument("--pm25",      type=float, default=0, dest="pm25_ugm3")
+    p.add_argument("--uv",        type=float, default=0, dest="uv_index")
+    p.add_argument("--noise",     type=float, default=0, dest="noise_db")
+    p.add_argument("--lux",       type=float, default=0)
+    p.add_argument("--quality",   type=int,   default=1, dest="quality_flag")
+    p.add_argument("--notes",     default="")
+
+    p = sub.add_parser("trend", help="Metric trend over N days")
+    p.add_argument("--station", required=True, dest="station_id")
+    p.add_argument("--metric",  required=True, choices=METRICS)
+    p.add_argument("--days",    type=int, default=30)
+
+    p = sub.add_parser("extreme", help="Detect extreme readings")
+    p.add_argument("--station", required=True, dest="station_id")
+    p.add_argument("--pct",     type=float, default=95, dest="threshold_pct")
+    p.add_argument("--days",    type=int,   default=365)
+
+    p = sub.add_parser("anomaly", help="Anomaly detection vs baseline")
+    p.add_argument("--station",  required=True, dest="station_id")
+    p.add_argument("--baseline", type=int, default=30, dest="baseline_days")
+    p.add_argument("--compare",  type=int, default=7,  dest="compare_days")
+
+    p = sub.add_parser("export", help="Export time series")
+    p.add_argument("--station", required=True, dest="station_id")
+    p.add_argument("--metric",  required=True, choices=METRICS)
+    p.add_argument("--format",  choices=["csv","json"], default="csv", dest="fmt")
+    p.add_argument("--days",    type=int, default=30)
+
+    p = sub.add_parser("fleet", help="Fleet status overview")
+
     args = parser.parse_args()
-    
-    network = NanoSensorNetwork()
-    
-    try:
-        if args.command == "fleet":
-            status = network.fleet_status()
-            print(json.dumps(status, indent=2))
-        
-        elif args.command == "ingest":
-            success = network.ingest_reading(args.sensor_id, args.value, args.quality)
-            if success:
-                print(f"✓ Ingested {args.value} for {args.sensor_id}")
-            else:
-                print(f"✗ Sensor {args.sensor_id} not found")
-        
-        elif args.command == "anomalies":
-            anom = network.get_anomalies(args.sensor_id, args.threshold)
-            if anom:
-                print(f"Found {len(anom)} anomalies:")
-                for reading in anom:
-                    print(f"  {reading.timestamp}: {reading.value} (quality: {reading.quality})")
-            else:
-                print(f"No anomalies found for {args.sensor_id}")
-        
-        else:
-            parser.print_help()
-    
-    finally:
-        network.close()
+
+    if args.cmd == "register":
+        st = register_station(args.station_id, args.location, args.latitude,
+                              args.longitude, args.altitude_m, args.sensor_type, args.notes)
+        _print({"status": "registered", "station": st.to_dict()})
+
+    elif args.cmd == "log":
+        r = log_record(
+            args.station_id, args.temp_c, args.humidity_pct, args.pressure_hpa,
+            args.precipitation_mm, args.wind_ms, args.co2_ppm, args.pm25_ugm3,
+            args.uv_index, args.noise_db, args.lux, args.quality_flag, args.notes,
+        )
+        _print({"status": "logged", "id": r.id, "station": r.station_id,
+                "temp_c": r.temp_c, "recorded_at": r.recorded_at})
+
+    elif args.cmd == "trend":
+        _print(get_trend(args.station_id, args.metric, args.days))
+
+    elif args.cmd == "extreme":
+        _print(detect_extreme(args.station_id, args.threshold_pct, args.days))
+
+    elif args.cmd == "anomaly":
+        _print(calculate_anomaly(args.station_id, args.baseline_days, args.compare_days))
+
+    elif args.cmd == "export":
+        print(export_timeseries(args.station_id, args.metric, args.fmt, args.days))
+
+    elif args.cmd == "fleet":
+        _print(fleet_status())
 
 
 if __name__ == "__main__":
